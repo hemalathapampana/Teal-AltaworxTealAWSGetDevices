@@ -189,3 +189,102 @@ if (tealDeviceDataTable.Rows.Count > 0)
 - Truncate SP clears all Teal staging tables at start
 - Update SP merges latest staged rows (by most recent CreatedDate per EID), inserts new, marks missing as Unknown, records last sync and audit rows
 - Auth SP supplies credentials and billing cycle inputs for the run
+
+---
+
+## Q&A: Detailed answers to all earlier questions
+
+- **What triggers this Lambda—another Lambda, schedule, or manual?**
+  - Schedule via EventBridge starts a run with no SQS record; subsequent paging is triggered by SQS messages on `TealDestinationQueueGetDevicesURL`.
+
+- **Why is SQL retry done first, and what issue does it prevent?**
+  - The initial truncate and final update are wrapped by a SQL transient retry policy to avoid failing a run due to transient DB errors and to ensure staging is reliably cleared before new data is written.
+
+- **Are device and BAN staging tables cleared at the start?**
+  - Device and usage staging are cleared (`TealDeviceStaging`, `TealDeviceUsageStaging`, `TealDeviceUsageDailyStaging`, `TealDeviceSMSUsageStaging`). BAN is not part of this Lambda.
+
+- **Aren’t staging tables already cleared after the previous run?**
+  - The Lambda does not assume that; it explicitly truncates at the start of each Service Provider sync.
+
+- **Which staging table stores BAN, FAN, and Number statuses?**
+  - Not applicable. This Lambda only writes to `TealDeviceStaging`; BAN/FAN/Number statuses are not handled here.
+
+- **Are BAN list statuses read from BillingAccountNumberStatusStaging or elsewhere?**
+  - Not used. No BAN list status reads occur in this flow.
+
+- **What is the page size/limit?**
+  - 100 (`TealHelper.CommonConfig.PAGE_SIZE = 100`).
+
+- **How does the system know all API pages are processed?**
+  - When a page returns no `Entries` (after page 0), it marks `isLastPage = true`. It also stops if fail count hits 5 or remaining Lambda time is too low.
+
+- **What parameters are used in GetTelegenceDeviceBySubscriberNumber?**
+  - Not part of this Lambda.
+
+- **What happens to devices that fail validation?**
+  - The Lambda does not perform device-level validation. All fetched devices are staged. Validation/merge logic is executed within `usp_Teal_Update_Device_From_Staging` (e.g., mapping statuses and marking missing as Unknown).
+
+- **What is the retry setup for Polly (attempts, delay)?**
+  - HTTP: `RetryPolicyHelper.PollyRetryHttpRequestAsync(logger, 3)` inside `TealAPIService` (3 attempts; helper defines delay strategy).
+  - Wrapper: `TealHelper.BuildRetryPolicy` provides 3 retries with exponential delays 3s, 9s, 27s, with a fallback that marks the operation as error.
+
+- **How is re-enqueuing handled for incomplete or timed-out device lists?**
+  - If more pages remain or nearing timeout, it sends a new SQS message to `TealDestinationQueueGetDevicesURL` with attributes `PageNumber` and `CurrentServiceProviderId`, delayed by 30s.
+
+- **How do the stored procedures work in the flow?**
+  - Start-of-SP sync: truncate SP clears staging.
+  - After paging: bulk copy to staging.
+  - Completion: update-from-staging SP merges into main tables, marks missing as Unknown, updates bill cycle metadata and writes audit/last-sync rows.
+
+- **What details are captured in the summary logs?**
+  - Start/end, page number and size, device count per page, bulk copy start, SQL/HTTP errors, not-enough-time messages, failure-count stop, enqueue details (message body and queue URL), completion message, next Service Provider id.
+
+- **How are reference items (functions, queues, procedures) used in the flow?**
+  - Functions/classes: `TealAPIService`, `TealRepository`, `AwsFunctionBase.SqlBulkCopy`, `ServiceProviderCommon.GetNextServiceProviderId`.
+  - Queues: `TealDestinationQueueGetDevicesURL` for paging; `TealDeviceUsageQueueURL` for usage step.
+  - Procedures: as detailed above.
+
+- **Can you detail all Lambdas covering these points for all carriers?**
+  - Scope here is only Teal (`AltaworxTealAWSGetDevices`). Other carriers are not part of this answer.
+
+- **Who publishes the first SQS message to ThingSpaceDeviceQueueURL?**
+  - Not applicable. ThingSpace is Verizon. Teal flow uses `TealDestinationQueueGetDevicesURL` and `TealDeviceUsageQueueURL`.
+
+- **What is the configured batch size limit for device groups?**
+  - Not applicable to Teal device fetch. SQL bulk copy batch size is controlled by `SQLConstant.BatchSize` (shared constant).
+
+- **For AltaworxTealAWSGetDevices, provide the exact API endpoint and rate limits.**
+  - Endpoint pattern: `{BaseUrl}/{TealDevicesGetURL}?requestId=...&offset=...&limit=...`.
+  - `TealDevicesGetURL` typically resolves to `api/v1/esims`. Rate limits are not set here; only page-size cap (100) and retries are handled.
+
+- **How are delayed messages (30s, 5min) handled—CloudWatch visibility or explicit delay?**
+  - Explicit SQS delay: `DelaySeconds = 30` on send. No 5-minute delay logic in this Lambda.
+
+- **Where are failed ICCIDs logged if device fetch fails?**
+  - Failures are logged at the request/page level. There is no per-ICCID failure logging in this Lambda.
+
+- **Provide retry configuration for Polly SQL/HTTP retries.**
+  - SQL: `RetryPolicyHelper.GetSqlTransientPolicy(...)` wraps stored procedure calls.
+  - HTTP: `RetryPolicyHelper.PollyRetryHttpRequestAsync(logger, 3)` for HTTP calls.
+  - Additional wrapper: `TealHelper.BuildRetryPolicy` (3/9/27 seconds backoff; 3 attempts) on the initial list request.
+
+- **What happens if a group remains partially unprocessed after retries?**
+  - If `failCount >= 5`, the device-sync step stops early; the Lambda finalizes the run (executes the update SP), triggers the usage step, and proceeds to the next Service Provider, leaving the partial page(s) unprocessed in that run.
+
+---
+
+## Stored Procedure Behavior (from provided SQL)
+
+- **[dbo].[usp_Teal_Truncate_Device_And_Usage_Staging]**
+  - Truncates: `TealDeviceStaging`, `TealDeviceUsageStaging`, `TealDeviceUsageDailyStaging`, `TealDeviceSMSUsageStaging`.
+
+- **[dbo].[usp_Teal_Update_Device_From_Staging] (@ServiceProviderId, @BillingCycleEndDay, @BillingCycleEndHour, @BillMonth, @BillYear, @NextBillCycleDate)**
+  - Inserts last-sync snapshot into `TealDeviceDetailLastSyncDate` with queue count.
+  - Merges from top-1-per-EID (latest CreatedDate) staging rows into `TealDevice`:
+    - MATCHED: updates identifiers, plan, status, client info, SKU, billing metadata; sets `LastActivatedDate` when status changes to Activated.
+    - NOT MATCHED BY TARGET (for the SP): inserts new active devices with billing metadata.
+    - NOT MATCHED BY SOURCE (for the SP): marks missing devices as `Unknown` with `UnknownStatusId`.
+  - Inserts an audit summary row into `TealDeviceSyncAudit` pivoting counts of `ACTIVATED` and `DEACTIVATED` per SP; computes bill month/year based on cycle end day/hour.
+
+- **[dbo].[usp_Teal_Get_AuthenticationByProviderId] (@providerId)**
+  - Returns `IntegrationAuthenticationId`, `BaseUrl`, `APIKey`, `APISecret`, `WriteIsEnabled`, `BillPeriodEndDay`, `BillPeriodEndHour` for Teal (IntegrationId 12) and the given Service Provider.
